@@ -4,6 +4,8 @@ Display large monsters' HP info in real time.
 This is an overlay homebrew dedicated to Nintendo Switch.
 You need to have installed Tesla environment to use it.
 
+You can exit from info page by pressing and holding Left Stick + Right Stick. To exit from main menu press B.
+
 # ScreenShots
 ### Chinese
 ![Chinese](resources/Chinese.jpg)
