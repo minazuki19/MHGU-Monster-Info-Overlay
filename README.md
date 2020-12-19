@@ -14,6 +14,7 @@ You can exit from info page by pressing and holding Left Stick + Right Stick. To
 
 # Requirements:
 - Tesla Menu >=1.0.2
+- MHGU ver 1.4.0
 
 # Thanks to:
 - masagrator for learning code from [masagrator/Status-Monitor-Overlay](https://github.com/masagrator/Status-Monitor-Overlay)
