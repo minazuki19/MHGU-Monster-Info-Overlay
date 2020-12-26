@@ -3,9 +3,10 @@
 #include "monster.hpp"
 #include "dmntcht.h"
 
-#define MONSTER_POINTER_LIST_OFFSET 0x10C820AC
+// #define MONSTER_POINTER_LIST_OFFSET 0x10C820AC
 #define MHGU_TITLE_ID 0x0100770008DD8000
-#define ASCII_ZH 0x687A
+#define SEARCH_START_OFFSET 0x10C80000
+#define SEARCH_END_OFFSET 0x10C90000
 
 //Common
 Thread t0;
@@ -13,6 +14,7 @@ bool threadexit = false;
 uint64_t refresh_interval = 1;
 
 //MHGU
+u32 MONSTER_POINTER_LIST_OFFSET = 0;
 MonsterPointerList mlist;
 char Monster1_Name[32];
 char Monster2_Name[32];
@@ -24,6 +26,7 @@ Monster new_m1;
 Monster new_m2;
 Monster m;
 u8 largecount = 0;
+u8 foundpointer = 0;
 
 //  Chinese 1, English 0
 u8 mname_lang = 1;
@@ -56,9 +59,141 @@ void checkMHGURunning()
     }
 }
 
+// get heap start address
+void setHeapBase() {
+    if (mhgu_running) {
+        bool out = false;
+        dmntchtHasCheatProcess(&out);
+        if (out == false) dmntchtForceOpenCheatProcess();
+        DmntCheatProcessMetadata mhguProcessMetaData;
+        dmntchtGetCheatProcessMetadata(&mhguProcessMetaData);
+        heap_base = mhguProcessMetaData.heap_extents.base;
+    } else {
+        heap_base = 0;
+    }
+}
+
+// check if there is offset file existing
+void checkListPointer() {
+    if (!MONSTER_POINTER_LIST_OFFSET) {
+        FILE* MPLoffset = fopen("sdmc:/switch/.overlays/MHGU-Monster-Info-Overlay.hex", "rb");
+        if (MPLoffset != NULL) {
+            fread(&MONSTER_POINTER_LIST_OFFSET, 0x4, 1, MPLoffset);
+            fclose(MPLoffset);
+        }
+    }
+}
+
+// find monster list pointer
+void findListPointer() {
+    if (!mhgu_running || !heap_base) {
+        MONSTER_POINTER_LIST_OFFSET = 0;
+        return;
+    }
+    u32 offset = 0;
+    u32 maxlen = SEARCH_END_OFFSET - SEARCH_START_OFFSET;
+    u8* buffer = (u8*) malloc(sizeof(u8) * maxlen);
+    u32 loopend = maxlen - sizeof(MonsterPointerList);
+    dmntchtReadCheatProcessMemory(heap_base+SEARCH_START_OFFSET, buffer, maxlen);
+    while (offset < loopend)
+    {
+        MonsterPointerList* l = (MonsterPointerList*)(buffer + offset);
+        u8 skip = 0;  //flag for whether we should skip to next offset (for inner loops)
+
+        //check the 22 bytes of unused
+        //note: the boundary condition is wrong, should be i >= 0; however, this causes the game to fail to load for some reason
+        //      So, leaving this "error" in for now; it seems to work OK
+        for (u8 i = 21; i > 0; i--)
+        {
+            if (l->unused[i] > 1)
+            {
+                offset += i + 2;
+                skip = 1;
+                break;
+            }
+            else if (l->unused[i] == 1)
+            {
+                offset += i + 1;
+                skip = 1;
+                break;
+            }
+        }
+        if (skip)
+        {
+            //only advance even numbers
+            if (offset % 2)
+            {
+                offset++;
+            }
+            continue;
+        }
+
+        //check the first two fixed bytes
+        if (l->fixed1 != 1 || l->fixed2 != 1)
+        {
+            offset += 24;
+            continue;
+        }
+
+        //check the monster pointers:
+        // 1. if one is 0, the rest must be 0
+        // 2. should add up to count
+        u8 my_count = 0;
+        u8 should_be_0 = 0;
+        for (u8 i = 0; i < MAX_POINTERS_IN_LIST; i++)
+        {
+            u32 p = (u32)(l->m[i]);
+
+            if (p == 0)
+            {
+                if (i == 0)
+                { //must have at least 1 monster to be sure it's valid
+                    skip = 1;
+                    break;
+                }
+                else
+                {
+                    should_be_0 = 1;
+                }
+            }
+            else if (should_be_0)
+            { //there shouldn't be null pointers in between entries in the list
+                skip = 1;
+                break;
+            }
+            else
+            {
+                my_count++;
+            }
+        }
+        if (skip || my_count != l->count)
+        { //only skip the fixed and unused bytes
+            offset += 24;
+            continue;
+        }
+
+        //we found it!!!
+        free(buffer);
+        MONSTER_POINTER_LIST_OFFSET = SEARCH_START_OFFSET + offset;
+        FILE* MPLoffset = fopen("sdmc:/switch/.overlays/MHGU-Monster-Info-Overlay.hex", "wb");
+        fwrite(&MONSTER_POINTER_LIST_OFFSET, 0x4, 1, MPLoffset);
+        fclose(MPLoffset);
+        MONSTER_POINTER_LIST_OFFSET = 0;
+        foundpointer = 1;
+        return;
+    }
+    free(buffer);
+    MONSTER_POINTER_LIST_OFFSET = 0;
+    return;
+}
+
 // update monster info
 void updateMonsterCache()
 {
+    if (!mhgu_running || !heap_base || !MONSTER_POINTER_LIST_OFFSET) {
+        return;
+    }
+    mlistptr = heap_base + MONSTER_POINTER_LIST_OFFSET;
     dmntchtReadCheatProcessMemory(mlistptr, &mlist, sizeof mlist);
     u32 new_m1_ptr = 0;
     u32 new_m2_ptr = 0;
@@ -208,6 +343,7 @@ void updateMonsterCache()
     largecount = count;
 }
 
+// check if service is already registered
 bool isServiceRunning(const char *serviceName) {
     Handle handle;
     SmServiceName service_name = smEncodeName(serviceName);
@@ -219,20 +355,14 @@ bool isServiceRunning(const char *serviceName) {
     }
 }
 
+// main loop running in a new thread.
 void getMonsterInfo(void*) {
     initMonsterInfoDB();
     while (threadexit == false) {
         checkMHGURunning();
-        if (mhgu_running) {
-            DmntCheatProcessMetadata mhguProcessMetaData;
-            dmntchtGetCheatProcessMetadata(&mhguProcessMetaData);
-            heap_base = mhguProcessMetaData.heap_extents.base;
-            mlistptr = heap_base + MONSTER_POINTER_LIST_OFFSET;
-            updateMonsterCache();
-        } else {
-            heap_base = 0;
-            mlistptr = 0;
-        }
+        checkListPointer();
+        setHeapBase();
+        updateMonsterCache();
         //interval
         svcSleepThread(1'000'000'000 * refresh_interval);
     }
@@ -251,6 +381,49 @@ void CloseThreads() {
     threadClose(&t0);
     threadexit = false;
 }
+
+class FindOverlay : public tsl::Gui {
+public:
+    FindOverlay() { }
+
+    // Called when this Gui gets loaded to create the UI
+    // Allocate all elements on the heap. libtesla will make sure to clean them up when not needed anymore
+    virtual tsl::elm::Element* createUI() override {
+        // A OverlayFrame is the base element every overlay consists of. This will draw the default Title and Subtitle.
+        // If you need more information in the header or want to change it's look, use a HeaderOverlayFrame.
+        auto frame = new tsl::elm::OverlayFrame("MHGU-Monster-Info", APP_VERSION);
+
+        auto Status = new tsl::elm::CustomDrawer([](tsl::gfx::Renderer *renderer, u16 x, u16 y, u16 w, u16 h) {
+            if (!foundpointer) {
+                renderer->drawString("\uE150 ERROR", false, 130, 260, 30, renderer->a(0xFFFF));
+                renderer->drawString("Advice:", false, 40, 320, 20, renderer->a(0xFFFF));
+                renderer->drawString("1. Make sure MHGU v1.4.0 is running.\n\n2. Start a quest with some monsters.\n\n3. Find again.", false, 40, 360, 20, renderer->a(0xFFFF));
+            } else {
+                renderer->drawString("FOUND!", false, 150, 200, 30, renderer->a(0xFFFF));
+                renderer->drawString("Pointer is saved to \n\nSD:/switch/.overlays/MHGU-\n\nMonster-Info-Overlay.hex\n\nDo not remove it.\n\n\n\nFind again if it does not work.", false, 40, 240, 20, renderer->a(0xFFFF));
+            }
+        });
+
+        // Add the list to the frame for it to be drawn
+        frame->setContent(Status);
+
+        // Return the frame to have it become the top level element of this Gui
+        return frame;
+    }
+
+    // Called once every frame to update values
+    virtual void update() override {
+    }
+
+    // Called once every frame to handle inputs not handled by other UI elements
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
+        if (keysDown & HidNpadButton_B) {
+            tsl::goBack();
+            return true;
+        }
+        return false;
+    }
+};
 
 class InfoOverlay : public tsl::Gui {
 public:
@@ -275,7 +448,7 @@ public:
                     renderer->drawString(m_cache[0].mptr ? Monster1_Name:Monster2_Name, false, 35, 475, 30, renderer->a(0xFFFF));
                     renderer->drawString(m_cache[0].mptr ? Monster1_Info:Monster1_Info, false, 40, 515, 20, renderer->a(0xFFFF));
                 } else {
-                    renderer->drawString(mname_lang ? "    未发现\n\n   大型怪物":"NO LARGE\n\nMONSTERS\n\nFOUND", false, 60, 530, 30, renderer->a(0xFFFF));
+                    renderer->drawString(mname_lang ? "    未发现\n\n   大型怪物":"NO LARGE\n\nMONSTERS", false, 60, 530, 30, renderer->a(0xFFFF));
                 }
 
             } else {
@@ -319,12 +492,11 @@ public:
     MainMenu() { }
 
     virtual tsl::elm::Element* createUI() override {
-        checkMHGURunning();
 
         auto rootFrame = new tsl::elm::OverlayFrame("MHGU-Monster-Info", APP_VERSION);
         auto list = new tsl::elm::List();
 
-        auto en_info = new tsl::elm::ListItem("English");
+        auto en_info = new tsl::elm::ListItem("Info: English");
         en_info->setClickListener([](uint64_t keys) {
             if (keys & HidNpadButton_A) {
                 StartThreads();
@@ -341,7 +513,7 @@ public:
         });
         list->addItem(en_info);
 
-        auto zh_info = new tsl::elm::ListItem("简体中文");
+        auto zh_info = new tsl::elm::ListItem("Info: 简体中文");
         zh_info->setClickListener([](uint64_t keys) {
             if (keys & HidNpadButton_A) {
                 StartThreads();
@@ -360,7 +532,27 @@ public:
 
         list->addItem(new tsl::elm::CustomDrawer([](tsl::gfx::Renderer *renderer, u16 x, u16 y, u16 w, u16 h) {
             renderer->drawString("\uE016  Hold Left Stick & Right Stick to go back here.", false, x+10, y+30, 15, renderer->a(0xFFFF));
-        }), 30);
+        }), 100);
+
+        auto findp = new tsl::elm::ListItem("Find Pointer");
+        findp->setClickListener([](uint64_t keys) {
+            if (keys & HidNpadButton_A) {
+                checkMHGURunning();
+                checkListPointer();
+                setHeapBase();
+                foundpointer = 0;
+                findListPointer();
+                tsl::changeTo<FindOverlay>();
+                return true;
+            }
+            return false;
+        });
+        list->addItem(findp);
+
+        list->addItem(new tsl::elm::CustomDrawer([](tsl::gfx::Renderer *renderer, u16 x, u16 y, u16 w, u16 h) {
+            renderer->drawString("\uE016  Must Do Once On First Install.\n\n1. Make sure MHGU v1.4.0 is running.\n\n2. Start a quest with some monsters.\n\n3. Find Pointer.", false, x+10, y+30, 15, renderer->a(0xFFFF));
+        }), 130);
+
 
         rootFrame->setContent(list);
 
@@ -368,6 +560,7 @@ public:
     }
 
     virtual void update() override {
+        checkMHGURunning();
         if (TeslaFPS != 60) {
             FullMode = true;
             tsl::hlp::requestForeground(true);
@@ -377,7 +570,7 @@ public:
         }
     }
     virtual bool handleInput(uint64_t keysDown, uint64_t keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
-        if (keysHeld & HidNpadButton_B) {
+        if (keysDown & HidNpadButton_B) {
             tsl::goBack();
             return true;
         }
@@ -387,7 +580,7 @@ public:
 
 class MonitorOverlay : public tsl::Overlay {
 public:
-                                             // libtesla already initialized fs, hid, pl, pmdmnt, hid:sys and set:sys
+    // libtesla already initialized fs, hid, pl, pmdmnt, hid:sys and set:sys
     virtual void initServices() override {
         Atmosphere_present = isServiceRunning("dmnt:cht");
         if (Atmosphere_present == true) dmntchtInitialize();

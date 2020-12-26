@@ -38,11 +38,16 @@ typedef struct
 } Monster;
 #pragma pack()
 
+#pragma pack(1)
 typedef struct
 {
-  u32 m[MAX_POINTERS_IN_LIST];   //0x10  monster pointer 32bit
-  u8 count;         //0x38: number of pointers
+    u8 fixed1; // fixed at 1
+    u8 fixed2; // fixed at 1
+    u8 unused[0x16];
+    u32 m[MAX_POINTERS_IN_LIST];   //0x10  monster pointer 32bit
+    u8 count;         //0x38: number of pointers
 } MonsterPointerList;
+#pragma pack()
 
 //#pragma pack(pop)
 
