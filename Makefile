@@ -38,7 +38,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
 APP_TITLE	:=	MHGU-Monster-Info
-APP_VERSION :=	0.2.3
+APP_VERSION :=	0.3.0
 
 TARGET		:=	$(notdir $(CURDIR))
 BUILD		:=	build
