@@ -5,8 +5,11 @@
 
 // #define MONSTER_POINTER_LIST_OFFSET 0x10C820AC
 #define MHGU_TITLE_ID 0x0100770008DD8000
-#define SEARCH_START_OFFSET 0x10C80000
-#define SEARCH_END_OFFSET 0x10C90000
+// Widen the search range to adapt to new system memory layouts ---
+// The original narrow range is no longer valid on newer systems.
+// This wider range increases the chance of finding the pointer.
+#define SEARCH_START_OFFSET 0x10A00000
+#define SEARCH_END_OFFSET 0x10F00000
 
 //Common
 Thread t0;
@@ -84,104 +87,148 @@ void checkListPointer() {
     }
 }
 
+// Add a helper function to validate monster data content ---
+// This helps filter out "false positives" by checking if the data makes logical sense.
+bool isMonsterDataSane(Monster* monster_data) {
+    // A real monster's Max HP should be within a reasonable range.
+    if (monster_data->max_hp <= 100 || monster_data->max_hp > 999999) return false;
+    // Current HP cannot be greater than Max HP.
+    if (monster_data->hp > monster_data->max_hp) return false;
+    return true;
+}
+
 // find monster list pointer
 void findListPointer() {
     if (!mhgu_running || !heap_base) {
         MONSTER_POINTER_LIST_OFFSET = 0;
         return;
     }
-    u32 offset = 0;
-    u32 maxlen = SEARCH_END_OFFSET - SEARCH_START_OFFSET;
-    u8* buffer = (u8*) malloc(sizeof(u8) * maxlen);
-    u32 loopend = maxlen - sizeof(MonsterPointerList);
-    dmntchtReadCheatProcessMemory(heap_base+SEARCH_START_OFFSET, buffer, maxlen);
-    while (offset < loopend)
-    {
-        MonsterPointerList* l = (MonsterPointerList*)(buffer + offset);
-        u8 skip = 0;  //flag for whether we should skip to next offset (for inner loops)
 
-        //check the 22 bytes of unused
-        //note: the boundary condition is wrong, should be i >= 0; however, this causes the game to fail to load for some reason
-        //      So, leaving this "error" in for now; it seems to work OK
-        for (u8 i = 21; i > 0; i--)
-        {
-            if (l->unused[i] > 1)
+    // Implement chunked scanning to prevent crashes from large memory allocation ---
+    // Instead of allocating a huge buffer, we scan memory in smaller, safer chunks.
+    const u32 CHUNK_SIZE = 65536; // 64KB is a safe and efficient size
+    u8* buffer = (u8*) malloc(CHUNK_SIZE);
+    if (!buffer) {
+        return; // malloc failed
+    }
+
+    u32 total_search_size = SEARCH_END_OFFSET - SEARCH_START_OFFSET;
+
+    // We overlap reads by sizeof(MonsterPointerList) to not miss patterns that cross chunk boundaries
+    for (u32 chunk_base_offset = 0; chunk_base_offset < total_search_size; chunk_base_offset += (CHUNK_SIZE - sizeof(MonsterPointerList))) {
+        u64 read_addr = heap_base + SEARCH_START_OFFSET + chunk_base_offset;
+        dmntchtReadCheatProcessMemory(read_addr, buffer, CHUNK_SIZE);
+
+        u32 offset_in_chunk = 0;
+        u32 loopend = CHUNK_SIZE - sizeof(MonsterPointerList);
+
+        while(offset_in_chunk < loopend) {
+            MonsterPointerList* l = (MonsterPointerList*)(buffer + offset_in_chunk);
+            u8 skip = 0;  //flag for whether we should skip to next offset (for inner loops)
+
+            //check the 22 bytes of unused
+            //note: the boundary condition is wrong, should be i >= 0; however, this causes the game to fail to load for some reason
+            //      So, leaving this "error" in for now; it seems to work OK
+            for (u8 i = 21; i > 0; i--)
             {
-                offset += i + 2;
-                skip = 1;
-                break;
+                if (l->unused[i] > 1)
+                {
+                    offset_in_chunk += i + 2;
+                    skip = 1;
+                    break;
+                }
+                else if (l->unused[i] == 1)
+                {
+                    offset_in_chunk += i + 1;
+                    skip = 1;
+                    break;
+                }
             }
-            else if (l->unused[i] == 1)
+            if (skip)
             {
-                offset += i + 1;
-                skip = 1;
-                break;
+                //only advance even numbers
+                if (offset_in_chunk % 2)
+                {
+                    offset_in_chunk++;
+                }
+                continue;
             }
-        }
-        if (skip)
-        {
-            //only advance even numbers
-            if (offset % 2)
+
+            //check the first two fixed bytes
+            if (l->fixed1 != 1 || l->fixed2 != 1)
             {
-                offset++;
+                offset_in_chunk += 24;
+                continue;
             }
-            continue;
-        }
 
-        //check the first two fixed bytes
-        if (l->fixed1 != 1 || l->fixed2 != 1)
-        {
-            offset += 24;
-            continue;
-        }
-
-        //check the monster pointers:
-        // 1. if one is 0, the rest must be 0
-        // 2. should add up to count
-        u8 my_count = 0;
-        u8 should_be_0 = 0;
-        for (u8 i = 0; i < MAX_POINTERS_IN_LIST; i++)
-        {
-            u32 p = (u32)(l->m[i]);
-
-            if (p == 0)
+            //check the monster pointers:
+            // 1. if one is 0, the rest must be 0
+            // 2. should add up to count
+            u8 my_count = 0;
+            u8 should_be_0 = 0;
+            for (u8 i = 0; i < MAX_POINTERS_IN_LIST; i++)
             {
-                if (i == 0)
-                { //must have at least 1 monster to be sure it's valid
+                u32 p = (u32)(l->m[i]);
+
+                if (p == 0)
+                {
+                    if (i == 0)
+                    { //must have at least 1 monster to be sure it's valid
+                        skip = 1;
+                        break;
+                    }
+                    else
+                    {
+                        should_be_0 = 1;
+                    }
+                }
+                else if (should_be_0)
+                { //there shouldn't be null pointers in between entries in the list
                     skip = 1;
                     break;
                 }
                 else
                 {
-                    should_be_0 = 1;
+                    my_count++;
                 }
             }
-            else if (should_be_0)
-            { //there shouldn't be null pointers in between entries in the list
-                skip = 1;
-                break;
+            if (skip || my_count != l->count)
+            { //only skip the fixed and unused bytes
+                offset_in_chunk += 24;
+                continue;
             }
-            else
-            {
-                my_count++;
-            }
-        }
-        if (skip || my_count != l->count)
-        { //only skip the fixed and unused bytes
-            offset += 24;
-            continue;
-        }
 
-        //we found it!!!
-        free(buffer);
-        MONSTER_POINTER_LIST_OFFSET = SEARCH_START_OFFSET + offset;
-        FILE* MPLoffset = fopen("sdmc:/switch/.overlays/MHGU-Monster-Info-Overlay.hex", "wb");
-        fwrite(&MONSTER_POINTER_LIST_OFFSET, 0x4, 1, MPLoffset);
-        fclose(MPLoffset);
-        MONSTER_POINTER_LIST_OFFSET = 0;
-        foundpointer = 1;
-        return;
+            // Validate the content of the found structure ---
+            Monster temp_monster;
+            Result rc = dmntchtReadCheatProcessMemory(l->m[0], &temp_monster, sizeof(Monster));
+
+            if (R_FAILED(rc) || !isMonsterDataSane(&temp_monster)) {
+                // If reading fails or the data is illogical, this is a false positive. Skip it.
+                offset_in_chunk += 24;
+                continue;
+            }
+
+            //we found it!!!
+            u32 found_offset = SEARCH_START_OFFSET + chunk_base_offset + offset_in_chunk;
+            free(buffer);
+
+            // Ensure data synchronization ---
+            // Immediately update the in-memory global variable so the display thread can use it.
+            MONSTER_POINTER_LIST_OFFSET = found_offset;
+
+            FILE* MPLoffset = fopen("sdmc:/switch/.overlays/MHGU-Monster-Info-Overlay.hex", "wb");
+            if (MPLoffset) { // Check if file opened successfully
+                fwrite(&found_offset, 0x4, 1, MPLoffset);
+                fclose(MPLoffset);
+            }
+
+            // The original code set MONSTER_POINTER_LIST_OFFSET to 0 here, which was a bug.
+            // We now keep the found value in memory for the display thread to use.
+            foundpointer = 1;
+            return;
+        }
     }
+
     free(buffer);
     MONSTER_POINTER_LIST_OFFSET = 0;
     return;
@@ -191,6 +238,7 @@ void findListPointer() {
 void updateMonsterCache()
 {
     if (!mhgu_running || !heap_base || !MONSTER_POINTER_LIST_OFFSET) {
+        largecount = 0; // Reset count if prerequisites are not met
         return;
     }
     mlistptr = heap_base + MONSTER_POINTER_LIST_OFFSET;
@@ -358,10 +406,13 @@ bool isServiceRunning(const char *serviceName) {
 // main loop running in a new thread.
 void getMonsterInfo(void*) {
     initMonsterInfoDB();
+    // Load from file once when the thread starts.
+    checkListPointer();
     while (threadexit == false) {
         checkMHGURunning();
-        checkListPointer();
         setHeapBase();
+        // The global offset is now updated directly by findListPointer,
+        // so we don't need to constantly check the file anymore in the loop.
         updateMonsterCache();
         //interval
         svcSleepThread(1'000'000'000 * refresh_interval);
@@ -370,16 +421,22 @@ void getMonsterInfo(void*) {
 
 //Start
 void StartThreads() {
-    threadCreate(&t0, getMonsterInfo, NULL, NULL, 0xF00, 0x3F, -2);
-    threadStart(&t0);
+    // A simple check to prevent creating multiple threads
+    if (t0.handle == 0) {
+        threadCreate(&t0, getMonsterInfo, NULL, NULL, 0x10000, 0x3F, -2);
+        threadStart(&t0);
+    }
 }
 
 //End
 void CloseThreads() {
-    threadexit = true;
-    threadWaitForExit(&t0);
-    threadClose(&t0);
-    threadexit = false;
+    if (t0.handle != 0) {
+        threadexit = true;
+        threadWaitForExit(&t0);
+        threadClose(&t0);
+        t0.handle = 0; // Reset handle for potential restart
+        threadexit = false;
+    }
 }
 
 class FindOverlay : public tsl::Gui {
@@ -432,6 +489,7 @@ public:
     // Called when this Gui gets loaded to create the UI
     // Allocate all elements on the heap. libtesla will make sure to clean them up when not needed anymore
     virtual tsl::elm::Element* createUI() override {
+        deactivateOriginalFooter = true;
         // A OverlayFrame is the base element every overlay consists of. This will draw the default Title and Subtitle.
         // If you need more information in the header or want to change it's look, use a HeaderOverlayFrame.
         auto frame = new tsl::elm::OverlayFrame("", "");
@@ -445,8 +503,14 @@ public:
                     renderer->drawString(Monster2_Name, false, 35, 615, 30, renderer->a(0xFFFF));
                     renderer->drawString(Monster2_Info, false, 40, 655, 20, renderer->a(0xFFFF));
                 } else if (largecount == 1) {
-                    renderer->drawString(m_cache[0].mptr ? Monster1_Name:Monster2_Name, false, 35, 475, 30, renderer->a(0xFFFF));
-                    renderer->drawString(m_cache[0].mptr ? Monster1_Info:Monster1_Info, false, 40, 515, 20, renderer->a(0xFFFF));
+                    // Check which monster slot is active to display correctly
+                    if(m_cache[0].mptr) {
+                        renderer->drawString(Monster1_Name, false, 35, 475, 30, renderer->a(0xFFFF));
+                        renderer->drawString(Monster1_Info, false, 40, 515, 20, renderer->a(0xFFFF));
+                    } else {
+                        renderer->drawString(Monster2_Name, false, 35, 475, 30, renderer->a(0xFFFF));
+                        renderer->drawString(Monster2_Info, false, 40, 515, 20, renderer->a(0xFFFF));
+                    }
                 } else {
                     renderer->drawString(mname_lang ? "    未发现\n\n   大型怪物":"NO LARGE\n\nMONSTERS", false, 60, 530, 30, renderer->a(0xFFFF));
                 }
@@ -465,19 +529,21 @@ public:
 
     // Called once every frame to update values
     virtual void update() override {
-        if (m_cache[0].mptr) {
+        // Use a safe check for max_hp to prevent division by zero
+        if (m_cache[0].mptr && m_cache[0].name) {
             snprintf(Monster1_Name, sizeof Monster1_Name, "%s", m_cache[0].name);
-            snprintf(Monster1_Info, sizeof Monster1_Info, "HP: %d/%d\n\nHP %%: %.2f%%", m_cache[0].hp, m_cache[0].max_hp, (float)m_cache[0].hp / (float)m_cache[0].max_hp * 100);
+            snprintf(Monster1_Info, sizeof Monster1_Info, "HP: %d/%d (%.1f%%)", m_cache[0].hp, m_cache[0].max_hp, m_cache[0].max_hp > 0 ? (float)m_cache[0].hp / (float)m_cache[0].max_hp * 100.0f : 0.0f);
         }
-        if (m_cache[1].mptr) {
+        if (m_cache[1].mptr && m_cache[1].name) {
             snprintf(Monster2_Name, sizeof Monster2_Name, "%s", m_cache[1].name);
-            snprintf(Monster2_Info, sizeof Monster2_Info, "HP: %d/%d\n\nHP %%: %.2f%%", m_cache[1].hp, m_cache[1].max_hp, (float)m_cache[1].hp / (float)m_cache[1].max_hp * 100);
+            snprintf(Monster2_Info, sizeof Monster2_Info, "HP: %d/%d (%.1f%%)", m_cache[1].hp, m_cache[1].max_hp, m_cache[1].max_hp > 0 ? (float)m_cache[1].hp / (float)m_cache[1].max_hp * 100.0f : 0.0f);
         }
     }
 
     // Called once every frame to handle inputs not handled by other UI elements
     virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
         if ((keysHeld & HidNpadButton_StickL) && (keysHeld & HidNpadButton_StickR)) {
+            deactivateOriginalFooter = false;
             CloseThreads();
             tsl::goBack();
             return true;
@@ -538,7 +604,6 @@ public:
         findp->setClickListener([](uint64_t keys) {
             if (keys & HidNpadButton_A) {
                 checkMHGURunning();
-                checkListPointer();
                 setHeapBase();
                 foundpointer = 0;
                 findListPointer();
@@ -569,7 +634,7 @@ public:
             refresh_interval = 1;
         }
     }
-    virtual bool handleInput(uint64_t keysDown, uint64_t keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
+    virtual bool handleInput(u64 keysDown, u64 keysHeld, touchPosition touchInput, JoystickPosition leftJoyStick, JoystickPosition rightJoyStick) override {
         if (keysDown & HidNpadButton_B) {
             tsl::goBack();
             return true;
@@ -588,6 +653,7 @@ public:
         setInitialize();
     }  // Called at the start to initialize all services necessary for this Overlay
     virtual void exitServices() override {
+        CloseThreads(); // Ensure background thread is stopped on exit
         dmntchtExit();
         pminfoExit();
         setExit();
@@ -597,6 +663,7 @@ public:
     virtual void onHide() override {}    // Called before overlay wants to change from visible to invisible state
 
     virtual std::unique_ptr<tsl::Gui> loadInitialGui() override {
+        t0.handle = 0; // Initialize thread handle
         return initially<MainMenu>();  // Initial Gui to load. It's possible to pass arguments to it's constructor like this
     }
 };
